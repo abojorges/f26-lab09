@@ -1,0 +1,38 @@
+# CampusReserve as several copies behind one proxy.
+#
+#   docker compose up -d --build --scale api=2
+#   docker compose ps                      # the copies' names
+#   docker compose logs api                # each copy's own tokens
+#   docker compose run --rm --no-deps -e TOKEN=... k6 run /load/tokens.js
+#
+# Wait several seconds after --scale before running a script: the proxy looks
+# the copies up again every five seconds.
+
+# Pinned so the copies are always f26-lab09-api-1, f26-lab09-api-2, ...
+# whatever the folder is called. The booking script addresses them by name.
+name: f26-lab09
+
+services:
+  # The HTTP server. No container_name and no published port, because
+  # --scale needs both left free. Each copy answers on 8080 inside the stack.
+  api:
+    build: .
+
+  # Spreads requests over every copy of api and names the one that answered
+  # in an X-Upstream header. Inside the stack it is http://proxy.
+  proxy:
+    image: nginx:1.27.5-alpine
+    volumes:
+      - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+  # The load generator, on the same network as everything else. The profile
+  # keeps `up` from starting it; `docker compose run` starts it on demand.
+  k6:
+    image: grafana/k6:2.3.0
+    volumes:
+      - ./load:/load:ro
+    profiles: ["load"]

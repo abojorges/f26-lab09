@@ -382,19 +382,157 @@ was dropped.
 
 ## Milestone 3: One boundary
 
-Take one problem from Milestone 1 or 2 and propose the boundary that fixes it.
+**The problem it fixes.** Finding 2, a *missing boundary*: nothing owns room time across
+copies. So the "at most once" check sits in each copy's `BookingService`, which reads its
+own process's store and then saves. That happens in
+`requestBooking`
+([BookingService.java#L112-L124](core-domain/src/main/java/edu/cmu/cs214/campusreserve/core/service/BookingService.java#L112-L124)),
+in `modifyBooking` (L200, then L209), and in waitlist promotion (L288, then L306). At
+two copies, `load/bookings.js` gets 3 of 3 slots confirmed twice.
 
-**The boundary.** The port, what it promises, and which side implements it. Say what
-moves and what stays.
+**What it ends, and how to check it.** Copy B's request for a slot copy A holds reaches
+`hold`, which answers `Taken`, so copy B waitlists the user (202) instead of confirming.
+The check is the same script, unchanged: `load/bookings.js` fails at two copies today
+and must pass at two copies afterwards.
 
-**Who owns the data.** Name the module that owns the data this boundary is about,
-and say what everybody else is allowed to do with it.
+**The boundary.** One owner of room time, behind the port core-domain already has.
 
-**The one invariant that must not cross.** Exactly one, stated so that a reader
-can tell whether a given piece of code violates it.
+- **The port.** `BookingStore` (core-domain, `core/ports/`) gains one method,
+  `Hold hold(Booking booking)`. Its promise: *store this booking only if no other held
+  booking for its room overlaps it, with the check and the write as one step for every
+  process that shares the store.* It answers `Held`, or `Taken` with the conflicting
+  bookings. A booking never collides with itself, so `hold` also serves a modify (same
+  id, new interval).
+- **Which side implements it.** `storage`, in a new adapter over one database that every
+  copy connects to (a `db` service in `compose.yaml`).
+  - The database enforces the rule through a table of 15-minute cells,
+    `room_slots(room_id, slot_start, booking_id)`, with `UNIQUE(room_id, slot_start)`.
+  - `hold` removes the booking's old cells and inserts its new ones in one transaction.
+    A uniqueness violation rolls the transaction back and answers `Taken`.
+  - `InMemoryBookingStore` implements `hold` too, with the check and the write under
+    one lock. Tests and the CLI keep using it.
+- **Why cells and not time ranges.** Every booking starts and ends on the 15-minute grid
+  ([BookingRules.java#L72](core-domain/src/main/java/edu/cmu/cs214/campusreserve/core/policy/BookingRules.java#L72),
+  [TimeInterval.java#L141](core-domain/src/main/java/edu/cmu/cs214/campusreserve/core/domain/TimeInterval.java#L141)).
+  So two bookings overlap exactly when they share a cell, and half-open intervals come
+  for free: `[10:00, 11:00)` and `[11:00, 12:00)` share no cell. That keeps another
+  overlap predicate out of SQL. The drift Milestone 1 found in `findConflicts` (D1)
+  does not get a third copy.
+- **What moves.** The final "free? then write" moves out of `BookingService` and into
+  `hold`, from all three places it happens today:
+  - create:
+    [BookingService.java#L112-L124](core-domain/src/main/java/edu/cmu/cs214/campusreserve/core/service/BookingService.java#L112-L124);
+  - modify: the check at L200, the save at L209;
+  - waitlist promotion: the check at L288, the save at L306.
+- **What stays.**
+  - In core-domain: `BookingRules` (duration, alignment, opening hours, one UTC day, the
+    owner check), the asker's own limits, the choice between waitlist and refusal when
+    `hold` answers `Taken`, and publishing the event after `Held`.
+  - `ConflictChecker` stays for the user's own calendar and for answering early, but its
+    answer is advice, never permission to write.
+  - Cancelling stays a plain `save`: it gives time back, so there is nothing to race for.
+  - `http-api`, `accounts`, and `notifications` do not change.
 
-**What the boundary costs.** An interface to keep, a second implementation to
-maintain, a performance argument to have again. Include what it leaves unfixed.
+**Who owns the data.** `storage` owns the bookings and the room-time cells, in the one
+shared database, and its adapter is the only code that touches those tables.
+- `BookingService` is the only writer, through the port: `hold` for anything that takes
+  room time, and `save` only for a status change that gives time back (cancel).
+- Everyone else reads only: `AvailabilityService`, billing's `InvoiceService`, the CLI,
+  and the HTTP handlers (through `BookingService`).
+- No copy keeps bookings of its own. A cache inside a copy would be another copy of the
+  data. It would need an owner, a staleness budget, and invalidation on
+  `booking-created`, `booking-modified`, `booking-cancelled`, and `waitlist-promoted`.
 
-Feel free to read the appendix on what a good proposal looks like in the Lab 3 handout
-before you write this section.
+**The one invariant that must not cross.** *Two CONFIRMED bookings for the same room
+never overlap (`[start, end)`, UTC), and only `hold`, inside `storage`, decides that.*
+Code outside `storage` breaks this if it concludes a room is free and then writes a
+booking that holds the room. Concretely, that is any production call of
+`BookingStore.save` with a CONFIRMED booking.
+`grep -rn 'bookings.save(' --include='*.java' */src/main` lists four calls today. Three
+save a CONFIRMED booking (L124, L209, L306), and they are exactly what moves. The fourth
+(L149) saves a cancellation, which is allowed.
+
+**What the boundary costs.**
+
+- **An interface to keep.** `hold` and its result type join the `BookingStore` contract,
+  and three implementations must keep it identical: the database adapter,
+  `InMemoryBookingStore`, and core-domain's test fake (`InMemoryStores`). D1 shows how
+  they drift: the fake used `overlaps`, the real store its own comparison, and no test
+  noticed. So the price includes one contract test suite run against all three
+  (half-open edges, a booking against itself, a modify that moves into its own old time).
+- **A second implementation to maintain.**
+  - The database adapter, its schema, and its migrations, all in version control.
+  - The build gets its first runtime dependency (a JDBC driver). That breaks "the Java
+    side has no runtime dependencies" ([ARCHITECTURE.md](ARCHITECTURE.md), line 3), so
+    that rule has to change first.
+  - `compose.yaml` gains a `db` service, and every test of the adapter needs a running
+    database.
+  - The grid becomes data. Changing `slotGranularityMinutes` in `BookingPolicy` stops
+    being a one-line change and becomes a migration of every cell row (expand, migrate,
+    contract).
+- **A performance argument to have again.**
+  - Availability was made fast by scanning memory in one pass (`findConflicts`, D1). A
+    single `GET /rooms/{roomId}/availability` calls `findConflicts` three times
+    (`freeOnDate`, `bookedMinutesOnDate`, and `utilizationOnDate`, which calls
+    `bookedMinutesOnDate` again), and four times with `minutes`
+    ([RoomsHandler.java#L80-L89](http-api/src/main/java/edu/cmu/cs214/campusreserve/http/RoomsHandler.java#L80-L89)).
+    Each of those becomes a database round trip.
+  - In the adapter, `findConflicts` becomes one indexed range read on the cells table.
+    If three round trips per request are still too many, the follow-up is to read once
+    per request. That would change `AvailabilityService` and its caller in
+    `RoomsHandler`, which are outside this boundary. A per-copy cache would avoid the
+    round trips, but it is a copy with a freshness obligation (above).
+  - Every booking also pays one database transaction.
+  - Priced as a claim a run can fail: `slot_double_booked count==0` at 2 and at 4
+    copies, and `p(95)` of `POST /bookings` under 100 ms at 50 bookings per second.
+    `load/bookings.js` already has the first threshold.
+- **A new single point of failure.** Today a copy that dies takes only its own bookings
+  with it. Afterwards, no copy can book while the database is down. The database needs
+  backups that have actually been restored, with a stated recovery point and recovery
+  time.
+- **What it leaves unfixed.**
+  - *Tokens (Finding 1).* Still per copy, so through the proxy about half of all booking
+    requests still get a 401 before they reach `hold`. Tokens need their own shared home
+    (a key-value store fits a lookup by token value).
+  - *The waitlist.* Entries and arrival numbers are still per copy
+    (`InMemoryWaitlistStore` keeps its own counter). "First in, first out" holds only
+    within one copy, and a cancel on copy 1 never promotes copy 2's waiters. Promotion
+    has to read the waitlist and hold room time in one step, so the waitlist would need
+    the same owner, which is a second boundary.
+  - *The per-user rules* (at most 5 active bookings, no overlap with your own
+    calendar). They count across rows, which a uniqueness constraint cannot express.
+    With a shared store the checks read the right data, but two simultaneous requests by
+    the same user can still both pass.
+  - *The event log and the outbox.* Both stay per copy and in memory (D4), so no single
+    log has every booking.
+
+**The alternative I compared: one lock, with the check left in core-domain.** Bookings
+still move to the shared database, as plain rows with no cells table. `storage` owns
+the rows and a lock that every copy takes before it writes. `BookingService` keeps its
+check-then-save unchanged (`ConflictChecker`, `TimeInterval.overlaps`) and runs it while
+holding that lock. The lock owner, not a constraint, stops two copies from writing at
+once.
+- *What it costs:* every booking on every copy waits for the same lock, so adding copies
+  adds no booking capacity. In the lecture's measurement of exactly this design,
+  throughput stayed flat and p95 grew as copies were added, while the constraint version
+  grew with the copies.
+- *What it saves:* nothing moves out of core-domain, the overlap check stays in one
+  place, and the 15-minute grid stays a policy value instead of stored data.
+
+**Why I prefer `hold`, and when I would not.**
+- *When `hold` is the better choice:* CampusReserve has to run as two or more copies,
+  either to carry booking load or to keep taking bookings when one copy dies. With the
+  lock, booking capacity is whatever one lock holder can serve, however many copies run.
+- *When I would pick the lock instead:* in either of two cases.
+  - The measured peak booking rate fits the 100 ms p95 budget under the lock. Measure it
+    by running `load/bookings.js` at that rate against the lock version.
+  - The slot grid is likely to change. The cells table turns a change of granularity
+    into a migration of every cell row, while the lock leaves it a policy change.
+- *When I would build neither:* one copy carries the load. Then I would run exactly one
+  copy and leave this boundary undone. One copy is already correct about bookings: the
+  single-copy control run of `load/bookings.js` passes.
+
+**The tradeoff in one sentence.** I pay one database transaction per booking, a database
+that must stay up, and a slot grid stored as data. In return, no slot is confirmed twice
+at any number of copies, and booking capacity grows with the copies, which the lock
+alternative does not give.
